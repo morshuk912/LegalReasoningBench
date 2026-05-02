@@ -1,0 +1,13 @@
+pandas
+numpy
+scikit-learn
+xgboost
+openai
+requests
+tqdm
+torch
+datasets
+transformers
+accelerate
+peft
+bitsandbytes

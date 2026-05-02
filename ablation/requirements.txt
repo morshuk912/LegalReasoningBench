@@ -1,0 +1,5 @@
+pandas
+openai
+requests
+scikit-learn
+tqdm
