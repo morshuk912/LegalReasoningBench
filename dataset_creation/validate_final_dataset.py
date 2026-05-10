@@ -12,6 +12,7 @@ from pathlib import Path
 import pandas as pd
 
 from prepare_final_binary_dataset import BINARY_LABELS, REQUIRED_COLUMNS, clean_text, normalize_frame, validate_columns
+from prepare_final_binary_dataset import text_word_statistics
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +51,10 @@ def main() -> None:
             str(label): int(count)
             for label, count in normalized["binary_outcome_label"].value_counts(dropna=False).to_dict().items()
         },
+        "unique_outcome_labels_before_binary_grouping": int(
+            normalized["final_outcome_label"].map(clean_text).replace("", pd.NA).dropna().nunique()
+        ),
+        "text_word_statistics": text_word_statistics(normalized),
         "duplicate_doc_ids": duplicate_doc_ids,
         "empty_required_targets": empty_required_targets,
         "unexpected_labels": unexpected,

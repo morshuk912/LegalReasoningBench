@@ -1,4 +1,6 @@
 pandas
+numpy
+scikit-learn
 requests
 torch
 transformers

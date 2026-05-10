@@ -1,7 +1,10 @@
 #!/bin/bash
 # Submit one model by passing MODEL_KEY=saullm|lawma|lawllm.
+# Set PROMPT_VARIANT=cot to run the CoT reasoning experiment without
+# overwriting the default outputs.
 # Example:
 #   MODEL_KEY=saullm sbatch scripts/run_reasoning_compare50.sbatch
+#   MODEL_KEY=saullm PROMPT_VARIANT=cot sbatch scripts/run_reasoning_compare50.sbatch
 
 #SBATCH --job-name=reasoning_compare50
 #SBATCH --output=slurm-%x-%j.out
@@ -30,4 +33,5 @@ python "$REPO_DIR/reasoning_benchmark/run_reasoning_generation.py" \
   --data_path "$DATA_PATH" \
   --output_dir "$OUTPUT_DIR" \
   --model_key "${MODEL_KEY:?Set MODEL_KEY=saullm, lawma, or lawllm}" \
+  --prompt_variant "${PROMPT_VARIANT:-unified}" \
   ${HF_TOKEN:+--hf_token "$HF_TOKEN"}

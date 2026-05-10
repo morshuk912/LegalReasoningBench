@@ -66,6 +66,50 @@ Return ONLY valid JSON:
 {{"reasoning_summary":"...","evidence_cues":["...","..."]}}
 """
 
+PROMPT_REASONING_COT = """You are a legal expert.
+
+Task: Write the COURT'S REASONING using structured reasoning steps.
+
+Rules:
+- Use ONLY information explicitly stated in the INPUT fields below.
+- Do NOT add new facts, parties, dates, or procedural events.
+- Focus on the court's rationale, not merely summarizing the parties' arguments.
+
+Follow these steps:
+
+Step 1: Identify the central legal conflict between the parties.
+
+Step 2: Explain how the key facts support or contradict each side's claims.
+
+Step 3: Derive the court's reasoning and justify why one position is accepted over the other.
+
+Final Answer:
+Write a concise 2-4 sentence summary of the court's reasoning based on the steps above.
+
+Additional requirements:
+- Each sentence should reflect a reasoning step.
+- Include exactly 2 short evidence cues copied from the INPUT (max 12 words each).
+- Each evidence cue must directly support part of the reasoning.
+
+INPUT:
+Facts:
+{facts}
+
+Plaintiff/Appellant Claims:
+{plaintiff}
+
+Defendant/Appellee Claims:
+{defendant}
+
+Return ONLY valid JSON:
+{{"reasoning_summary":"...","evidence_cues":["...","..."]}}
+"""
+
+PROMPT_VARIANTS = {
+    "unified": PROMPT_REASONING_UNIFIED,
+    "cot": PROMPT_REASONING_COT,
+}
+
 GEMINI_SCHEMA = {
     "type": "OBJECT",
     "properties": {
@@ -86,11 +130,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deepseek_model", default=MODEL_DEFAULTS["deepseek"])
     parser.add_argument("--gemini_model", default=MODEL_DEFAULTS["gemini"])
     parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--prompt_variant", choices=sorted(PROMPT_VARIANTS), default="unified")
+    parser.add_argument("--run_tag", default="", help="Optional suffix for output files, e.g. baseline_reasoning_models.")
     parser.add_argument("--max_input_chars", type=int, default=4500)
     parser.add_argument("--sleep_between_calls", type=float, default=0.45)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--merge_outputs", action="store_true")
     return parser.parse_args()
+
+
+def load_dotenv_if_present() -> None:
+    candidates = []
+    for base in [Path.cwd(), Path(__file__).resolve()]:
+        directory = base if base.is_dir() else base.parent
+        candidates.extend(parent / ".env" for parent in [directory, *directory.parents])
+    for path in candidates:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
 
 
 def resolve_column(frame: pd.DataFrame, candidates: list[str]) -> str:
@@ -123,6 +188,15 @@ def parse_json_or_none(text: str) -> dict[str, Any] | None:
     except Exception:
         return None
     return obj if isinstance(obj, dict) else None
+
+
+def output_suffix(args: argparse.Namespace) -> str:
+    parts = []
+    if args.prompt_variant != "unified":
+        parts.append(args.prompt_variant)
+    if args.run_tag:
+        parts.append(args.run_tag.strip().replace(" ", "_"))
+    return f"_{'_'.join(parts)}" if parts else ""
 
 
 def make_session() -> requests.Session:
@@ -168,8 +242,15 @@ def post_json_with_retries(
     raise RuntimeError(f"Request failed after retries: {last_error}")
 
 
-def build_prompt(row: pd.Series, plaintiff_col: str, defendant_col: str, max_input_chars: int) -> str:
-    return PROMPT_REASONING_UNIFIED.format(
+def build_prompt(
+    row: pd.Series,
+    plaintiff_col: str,
+    defendant_col: str,
+    max_input_chars: int,
+    prompt_variant: str,
+) -> str:
+    template = PROMPT_VARIANTS[prompt_variant]
+    return template.format(
         facts=clip(row.get(FACTS_COL, ""), max_input_chars),
         plaintiff=clip(row.get(plaintiff_col, ""), max_input_chars),
         defendant=clip(row.get(defendant_col, ""), max_input_chars),
@@ -180,19 +261,23 @@ def call_gpt(session: requests.Session, prompt: str, model: str, timeout: int) -
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("Missing OPENAI_API_KEY")
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "Return only JSON. No markdown. No explanation."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    if model.startswith("o"):
+        payload["max_completion_tokens"] = 2000
+    else:
+        payload["temperature"] = 0.0
+        payload["max_tokens"] = 280
     data = post_json_with_retries(
         session,
         "https://api.openai.com/v1/chat/completions",
         {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "Return only JSON. No markdown. No explanation."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.0,
-            "max_tokens": 280,
-        },
+        payload,
         timeout,
     )
     raw_text = data["choices"][0]["message"].get("content", "")
@@ -203,19 +288,28 @@ def call_deepseek(session: requests.Session, prompt: str, model: str, timeout: i
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise ValueError("Missing DEEPSEEK_API_KEY")
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "Return only JSON. No markdown. No explanation."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 280,
+    }
+    if model.startswith("deepseek-v4"):
+        payload.update(
+            {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "high",
+                "max_tokens": 4000,
+            }
+        )
     data = post_json_with_retries(
         session,
         "https://api.deepseek.com/chat/completions",
         {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "Return only JSON. No markdown. No explanation."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.0,
-            "max_tokens": 280,
-        },
+        payload,
         timeout,
     )
     raw_text = data["choices"][0]["message"].get("content", "")
@@ -234,7 +328,7 @@ def call_gemini(session: requests.Session, prompt: str, model: str, timeout: int
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 280,
+                "maxOutputTokens": 4000 if model.startswith("gemini-2.5") else 280,
                 "responseMimeType": "application/json",
                 "responseSchema": GEMINI_SCHEMA,
             },
@@ -275,12 +369,24 @@ def run_model(
     model_key: str,
     plaintiff_col: str,
     defendant_col: str,
+    checkpoint_path: Path | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     model_name = getattr(args, f"{model_key}_model")
+    completed_doc_ids: set[str] = set()
+
+    if checkpoint_path and checkpoint_path.exists():
+        checkpoint = pd.read_csv(checkpoint_path, dtype={CASE_ID_COL: str})
+        rows = checkpoint.to_dict("records")
+        if CASE_ID_COL in checkpoint.columns:
+            completed_doc_ids = set(checkpoint[CASE_ID_COL].dropna().astype(str))
 
     for _, row in cases.iterrows():
-        prompt = build_prompt(row, plaintiff_col, defendant_col, args.max_input_chars)
+        doc_id = str(row[CASE_ID_COL])
+        if doc_id in completed_doc_ids:
+            continue
+
+        prompt = build_prompt(row, plaintiff_col, defendant_col, args.max_input_chars, args.prompt_variant)
         parsed = None
         raw_text = ""
         error = ""
@@ -298,15 +404,18 @@ def run_model(
 
         rows.append(
             {
-                CASE_ID_COL: row[CASE_ID_COL],
+                CASE_ID_COL: doc_id,
                 "model_key": model_key,
                 "model_name": model_name,
+                "prompt_variant": args.prompt_variant,
                 "reasoning_summary": (parsed or {}).get("reasoning_summary"),
                 "evidence_cues": json.dumps((parsed or {}).get("evidence_cues"), ensure_ascii=False) if parsed else "",
                 "raw_text": raw_text,
                 "error": error,
             }
         )
+        if checkpoint_path:
+            pd.DataFrame(rows).to_csv(checkpoint_path, index=False)
         time.sleep(args.sleep_between_calls)
 
     return pd.DataFrame(rows)
@@ -327,11 +436,13 @@ def save_minimal_merge(args: argparse.Namespace, ids: pd.DataFrame, frame: pd.Da
             on=CASE_ID_COL,
             how="left",
         )
-    output_path = Path(args.output_dir) / "api_reasoning_same_subset_merged.csv"
+    suffix = output_suffix(args)
+    output_path = Path(args.output_dir) / f"api_reasoning_same_subset{suffix}_merged.csv"
     merged.to_csv(output_path, index=False)
 
 
 def main() -> None:
+    load_dotenv_if_present()
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -341,9 +452,12 @@ def main() -> None:
 
     outputs: dict[str, pd.DataFrame] = {}
     for model_key in args.models:
-        predictions = run_model(args, session, cases, model_key, plaintiff_col, defendant_col)
         model_name = getattr(args, f"{model_key}_model").replace("/", "__")
-        predictions.to_csv(output_dir / f"reasoning_{model_key}_{model_name}.csv", index=False)
+        suffix = output_suffix(args)
+        output_path = output_dir / f"reasoning_{model_key}_{model_name}{suffix}.csv"
+        checkpoint_path = output_dir / f"reasoning_{model_key}_{model_name}{suffix}.partial.csv"
+        predictions = run_model(args, session, cases, model_key, plaintiff_col, defendant_col, checkpoint_path)
+        predictions.to_csv(output_path, index=False)
         outputs[model_key] = predictions
 
     if args.merge_outputs:

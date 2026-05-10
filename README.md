@@ -24,6 +24,28 @@ Place local datasets under `data/` or pass explicit paths with the relevant CLI 
 
 The scripts accept alternative paths via arguments such as `--data_path`, `--input_csv`, `--base_csv`, and `--output_dir`.
 
+## Dataset Construction Statistics
+
+The reviewed source file contains 4,782 cases before binary filtering. Outcome labels were first annotated with 15 unique fine-grained labels, then grouped into the binary benchmark labels used in the main prediction task.
+
+| Statistic | Value |
+| --- | ---: |
+| Source cases before binary filtering | 4,782 |
+| Final binary benchmark cases | 4,042 |
+| Affirmed cases | 2,747 |
+| Reversed/Vacated cases | 1,295 |
+| Unique outcome labels before binary grouping | 15 |
+| Avg. full opinion words/tokens, non-empty rows | 2,401.1 |
+| Median full opinion words/tokens, non-empty rows | 2,031.0 |
+| Avg. extracted facts words/tokens | 135.7 |
+| Median extracted facts words/tokens | 135.0 |
+| Avg. judicial reasoning words/tokens | 83.3 |
+| Median judicial reasoning words/tokens | 83.0 |
+| Avg. plaintiff/appellant claim words/tokens | 43.3 |
+| Avg. defendant/appellee claim words/tokens | 39.9 |
+
+Lengths are regex word-token counts computed by `dataset_creation/prepare_final_binary_dataset.py`. The full-opinion average excludes 207 binary rows with empty `full_document`; extracted facts are present for all 4,042 binary rows, and judicial reasoning is present for 4,041 rows.
+
 ## Running Examples
 
 Prediction benchmark:
@@ -65,6 +87,18 @@ python reasoning_benchmark/run_api_reasoning_generation.py \
   --output_dir results/reasoning_benchmark \
   --models gpt deepseek gemini \
   --merge_outputs
+```
+
+Controlled RAG reasoning generation with GPT-4o:
+
+```bash
+python reasoning_benchmark/run_controlled_rag_reasoning.py \
+  --data_path data/final_dataset.csv \
+  --eval_ids_path data/reasoning_doc_ids.csv \
+  --output_dir results/reasoning_benchmark/rag_controlled \
+  --generator_model gpt-4o \
+  --top_k 3 \
+  --limit 50
 ```
 
 Gemma instruction tuning:

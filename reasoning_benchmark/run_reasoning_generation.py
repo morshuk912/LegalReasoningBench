@@ -77,6 +77,50 @@ Defendant/Appellee Claims:
 Court reasoning summary:
 """
 
+PROMPT_REASONING_COT = """You are a legal expert.
+
+Task: Write the COURT'S REASONING using structured reasoning steps.
+
+Rules:
+- Use ONLY information explicitly stated in the INPUT fields below.
+- Do NOT add new facts, parties, dates, or procedural events.
+- Focus on the court's rationale, not merely summarizing the parties' arguments.
+
+Follow these steps:
+
+Step 1: Identify the central legal conflict between the parties.
+
+Step 2: Explain how the key facts support or contradict each side's claims.
+
+Step 3: Derive the court's reasoning and justify why one position is accepted over the other.
+
+Final Answer:
+Write a concise 2-4 sentence summary of the court's reasoning based on the steps above.
+
+Additional requirements:
+- Each sentence should reflect a reasoning step.
+- Include exactly 2 short evidence cues copied from the INPUT (max 12 words each).
+- Each evidence cue must directly support part of the reasoning.
+
+INPUT:
+Facts:
+{facts}
+
+Plaintiff/Appellant Claims:
+{plaintiff}
+
+Defendant/Appellee Claims:
+{defendant}
+
+Return ONLY valid JSON:
+{{"reasoning_summary":"...","evidence_cues":["...","..."]}}
+"""
+
+PROMPT_VARIANTS = {
+    "unified": PROMPT_TEMPLATE,
+    "cot": PROMPT_REASONING_COT,
+}
+
 MODEL_CONFIGS = {
     "saullm": {
         "model_name": "Equall/Saul-7B-Instruct-v1",
@@ -110,6 +154,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", default="results/reasoning_benchmark")
     parser.add_argument("--model_key", choices=sorted(MODEL_CONFIGS), required=True)
     parser.add_argument("--adapter_dir", default=None)
+    parser.add_argument("--prompt_variant", choices=sorted(PROMPT_VARIANTS), default="unified")
     parser.add_argument("--max_input_chars", type=int, default=4500)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
@@ -157,17 +202,43 @@ def gold_reasoning(row: pd.Series) -> str:
     return ""
 
 
-def build_prompt(row: pd.Series, max_chars: int, prompt_style: str) -> str:
+def build_prompt(row: pd.Series, max_chars: int, prompt_style: str, prompt_variant: str) -> str:
     values = {
         "facts": clip(row.get(FACTS_COL, ""), max_chars),
         "plaintiff": clip(row.get(PLAINTIFF_COL, ""), max_chars),
         "defendant": clip(row.get(DEFENDANT_COL, ""), max_chars),
     }
-    template = LAWMA_PROMPT_TEMPLATE if prompt_style == "lawma_simple" else PROMPT_TEMPLATE
+    if prompt_variant == "cot":
+        template = PROMPT_VARIANTS[prompt_variant]
+    else:
+        template = LAWMA_PROMPT_TEMPLATE if prompt_style == "lawma_simple" else PROMPT_VARIANTS[prompt_variant]
     return template.format(**values)
 
 
-def cleanup_reasoning(text: str, prompt_style: str) -> str:
+def clean_json_text(text: str) -> str:
+    cleaned = clean_text(text).replace("```json", "").replace("```", "").strip()
+    if "{" in cleaned and "}" in cleaned:
+        cleaned = cleaned[cleaned.find("{") : cleaned.rfind("}") + 1]
+    return cleaned
+
+
+def parse_json_or_none(text: str) -> dict[str, Any] | None:
+    try:
+        obj = json.loads(clean_json_text(text))
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def cleanup_reasoning(text: str, prompt_style: str, prompt_variant: str = "unified") -> tuple[str, list[str]]:
+    if prompt_variant == "cot":
+        parsed = parse_json_or_none(text)
+        if parsed:
+            cues = parsed.get("evidence_cues") or []
+            if not isinstance(cues, list):
+                cues = []
+            return clean_text(parsed.get("reasoning_summary", "")), [clean_text(cue) for cue in cues[:2]]
+
     cleaned = clean_text(text)
     cleaned = re.sub(r"^Output:\s*", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r"\[/INST\]", " ", cleaned)
@@ -178,15 +249,15 @@ def cleanup_reasoning(text: str, prompt_style: str) -> str:
         if marker in lower:
             cleaned = cleaned[lower.find(marker) + len(marker) :].strip()
         if cleaned.lower().startswith("summarize the court"):
-            return ""
+            return "", []
         if re.search(r"\b(?:[A-T]\s+){8,}[A-T]\b", cleaned):
-            return ""
+            return "", []
         if re.fullmatch(r"[\d\s.,;:-]+", cleaned):
-            return ""
+            return "", []
         sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", cleaned) if sentence.strip()]
         if sentences:
             cleaned = " ".join(sentences[:4])
-    return cleaned
+    return cleaned, []
 
 
 def load_model(cfg: dict[str, Any], adapter_dir: str | None, hf_token: str | None):
@@ -255,13 +326,18 @@ def main() -> None:
 
     rows = []
     for _, row in tqdm(frame.iterrows(), total=len(frame), desc=f"Reasoning {args.model_key}"):
-        prompt = build_prompt(row, args.max_input_chars, cfg.get("prompt_style", "default"))
+        prompt = build_prompt(row, args.max_input_chars, cfg.get("prompt_style", "default"), args.prompt_variant)
         raw_text = ""
         reasoning_summary = ""
+        evidence_cues: list[str] = []
         error = ""
         try:
             raw_text = generate(prompt, tokenizer, model, cfg, args.temperature, args.top_p)
-            reasoning_summary = cleanup_reasoning(raw_text, cfg.get("prompt_style", "default"))
+            reasoning_summary, evidence_cues = cleanup_reasoning(
+                raw_text,
+                cfg.get("prompt_style", "default"),
+                args.prompt_variant,
+            )
             if not reasoning_summary:
                 error = "empty_after_cleanup"
         except Exception as exc:
@@ -273,18 +349,21 @@ def main() -> None:
                 "gold_outcome_label": row.get(LABEL_COL, ""),
                 "gold_reasoning": gold_reasoning(row),
                 "reasoning_summary": reasoning_summary,
+                "evidence_cues": json.dumps(evidence_cues, ensure_ascii=False),
                 "raw_text": raw_text,
                 "error": error,
                 "model_key": args.model_key,
                 "model_name": cfg["model_name"],
+                "prompt_variant": args.prompt_variant,
             }
         )
         time.sleep(args.sleep_between_cases)
 
-    output_path = output_dir / f"reasoning_{args.model_key}_same50.csv"
+    suffix = "" if args.prompt_variant == "unified" else f"_{args.prompt_variant}"
+    output_path = output_dir / f"reasoning_{args.model_key}_same50{suffix}.csv"
     pd.DataFrame(rows).to_csv(output_path, index=False)
-    run_config = {**cfg, "data_path": args.data_path, "adapter_dir": args.adapter_dir}
-    (output_dir / f"reasoning_{args.model_key}_run_config.json").write_text(
+    run_config = {**cfg, "data_path": args.data_path, "adapter_dir": args.adapter_dir, "prompt_variant": args.prompt_variant}
+    (output_dir / f"reasoning_{args.model_key}{suffix}_run_config.json").write_text(
         json.dumps(run_config, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,8 @@ REQUIRED_COLUMNS = [
 
 BINARY_LABELS = ["Affirmed", "Reversed/Vacated"]
 LEGACY_BINARY_OUTCOME_COLUMNS = ["final_outcome_group_expert4"]
+TEXT_STAT_COLUMNS = ["full_document", "facts", "reasoning", "claim_plaintiff", "claim_defendant"]
+WORD_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,6 +57,10 @@ def clean_text(value: Any) -> str:
     if pd.isna(value):
         return ""
     return str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def word_count(value: Any) -> int:
+    return len(WORD_PATTERN.findall(clean_text(value)))
 
 
 def validate_columns(frame: pd.DataFrame) -> None:
@@ -91,10 +98,29 @@ def build_final_dataset(frame: pd.DataFrame) -> pd.DataFrame:
     return final
 
 
-def validation_report(frame: pd.DataFrame) -> dict[str, Any]:
+def text_word_statistics(frame: pd.DataFrame) -> dict[str, dict[str, int | float]]:
+    stats: dict[str, dict[str, int | float]] = {}
+    for column in TEXT_STAT_COLUMNS:
+        counts = frame[column].map(word_count)
+        nonempty_counts = counts[counts > 0]
+        stats[column] = {
+            "nonempty_rows": int((counts > 0).sum()),
+            "empty_rows": int((counts == 0).sum()),
+            "avg_words_all_rows": round(float(counts.mean()), 1),
+            "median_words_all_rows": round(float(counts.median()), 1),
+            "avg_words_nonempty_rows": round(float(nonempty_counts.mean()), 1) if len(nonempty_counts) else 0.0,
+            "median_words_nonempty_rows": round(float(nonempty_counts.median()), 1) if len(nonempty_counts) else 0.0,
+            "max_words": int(counts.max()),
+        }
+    return stats
+
+
+def validation_report(frame: pd.DataFrame, source_frame: pd.DataFrame | None = None) -> dict[str, Any]:
     normalized = normalize_frame(frame)
+    source = normalize_frame(source_frame) if source_frame is not None else normalized
     duplicate_doc_ids = int(normalized["doc_id"].duplicated().sum())
     label_counts = normalized["binary_outcome_label"].value_counts(dropna=False).to_dict()
+    source_outcome_labels = source["final_outcome_label"].map(clean_text)
     empty_counts = {
         column: int(normalized[column].map(clean_text).eq("").sum())
         for column in REQUIRED_COLUMNS
@@ -104,6 +130,12 @@ def validation_report(frame: pd.DataFrame) -> dict[str, Any]:
         "rows": int(len(frame)),
         "columns": REQUIRED_COLUMNS,
         "label_counts": {str(key): int(value) for key, value in label_counts.items()},
+        "unique_outcome_labels_before_binary_grouping": int(source_outcome_labels[source_outcome_labels != ""].nunique()),
+        "outcome_label_counts_before_binary_grouping": {
+            str(label): int(count)
+            for label, count in source_outcome_labels[source_outcome_labels != ""].value_counts().to_dict().items()
+        },
+        "text_word_statistics": text_word_statistics(normalized),
         "duplicate_doc_ids": duplicate_doc_ids,
         "empty_counts": empty_counts,
         "unexpected_labels": unexpected_labels,
@@ -130,7 +162,7 @@ def main() -> None:
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     final.to_csv(output_csv, index=False, encoding="utf-8", quoting=csv.QUOTE_ALL)
 
-    report = validation_report(final)
+    report = validation_report(final, source)
     if not report["is_binary_only"]:
         raise ValueError(f"Final dataset contains unexpected labels: {report['unexpected_labels']}")
     if report["duplicate_doc_ids"]:
